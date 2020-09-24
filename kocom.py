@@ -47,7 +47,6 @@ device_h_dic = {v: k for k, v in device_t_dic.items()}
 cmd_h_dic = {v: k for k, v in cmd_t_dic.items()}
 room_h_dic = {'livingroom':'00', 'myhome':'00', 'room1':'01', 'room2':'02', 'room3':'03'}
 
-
 # mqtt functions ----------------------------
 
 def init_mqttc():
@@ -218,7 +217,7 @@ def send(dest, src, cmd, value, log=None, check_ack=True):
         # wait and checking for ACK
         ack_data.append(type_h_dic['ack'] + seq_h + '00' +  src + dest + cmd + value)
         try:
-            recv = ack_q.get(True, 0.3+0.2*random.random()) # random wait between 0.3~0.5 seconds for ACK
+            ack_q.get(True, 1.3+0.2*random.random()) # random wait between 1.3~1.5 seconds for ACK
             if config.get('Log', 'show_recv_hex') == 'True':
                 logging.info ('[ACK] OK')
             ret = send_data
@@ -321,7 +320,7 @@ def send_wait_response(dest, src=device_h_dic['wallpad']+'00', cmd=cmd_h_dic['st
 
     if send(dest, src, cmd, value, log, check_ack) != False:
         try:
-            ret = wait_q.get(True, 10)
+            ret = wait_q.get(True, 2)
             if publish==True:
                 publish_status(ret)
         except queue.Empty:
@@ -331,7 +330,55 @@ def send_wait_response(dest, src=device_h_dic['wallpad']+'00', cmd=cmd_h_dic['st
     return ret
 
 
-#===== parse MQTT --> send hex packet ===== 
+#===== elevator call via TCP/IP =====
+
+def call_elevator_tcpip():
+    import socket
+    sock = socket.socket()
+    sock.settimeout(10)
+
+    APT_SERVER = config.get('Elevator', 'tcpip_apt_server')
+    APT_PORT = int(config.get('Elevator', 'tcpip_apt_port'))
+
+    try:
+        sock.connect((APT_SERVER, APT_PORT))
+    except Exception as e:
+        logging.error('Apartment server socket connection failure : {} | server {}, port {}'.format(e, APT_SERVER, APT_PORT))
+        return False
+    logging.info('Apartment server socket connected | server {}, port {}'.format(APT_SERVER, APT_PORT))
+
+    try:
+        sock.send(bytearray.fromhex(config.get('Elevator', 'tcpip_packet1')))
+        rcv = sock.recv(512)
+        logging.info('recv from apt server: '+''.join("%02x" % i for i in rcv) )
+        time.sleep(0.1)
+        sock.send(bytearray.fromhex(config.get('Elevator', 'tcpip_packet2')))
+        rcv = sock.recv(512)
+        logging.info('recv from apt server: '+''.join("%02x" % i for i in rcv) )
+        sock.send(bytearray.fromhex(config.get('Elevator', 'tcpip_packet3')))
+        for itr in range(100):
+            rcv = sock.recv(512)
+            if len(rcv) == 0:
+                logging.info('apt server connection closed by peer')
+                sock.close()
+                return True
+            rcv_hex = ''.join("%02x" % i for i in rcv) 
+            logging.info('recv from apt server: '+rcv_hex )
+            if rcv_hex == config.get('Elevator', 'tcpip_packet4'):
+                logging.info('elevator arrived. sending last heartbeat' )
+                break
+        sock.send(bytearray.fromhex(config.get('Elevator', 'tcpip_packet2')))
+        rcv = sock.recv(512)
+        logging.info('recv from apt server: '+''.join("%02x" % i for i in rcv) )
+        sock.close()
+    except Exception as e:
+        logging.error('Apartment server socket communication failure : {}'.format(e))
+        return False
+
+    return True
+
+
+#===== parse MQTT --> send hex packet =====
 
 def mqtt_on_message(mqttc, obj, msg):
     command = msg.payload.decode('ascii')
@@ -339,7 +386,7 @@ def mqtt_on_message(mqttc, obj, msg):
 
     # do not process other than command topic
     if topic_d[-1] != 'command':
-        return         
+        return
 
     logging.info("[MQTT RECV] " + msg.topic + " " + str(msg.qos) + " " + str(msg.payload))
 
@@ -357,7 +404,7 @@ def mqtt_on_message(mqttc, obj, msg):
     elif 'thermo' in topic_d and 'set_temp' in topic_d:
         dev_id = device_h_dic['thermo']+'{0:02x}'.format(int(topic_d[3]))
         settemp_hex = '{0:02x}'.format(int(float(command)))
-        
+
         value = '1100' + settemp_hex + '0000000000'
         send_wait_response(dest=dev_id, value=value, log='thermo settemp')
 
@@ -387,15 +434,25 @@ def mqtt_on_message(mqttc, obj, msg):
     # elevator on/off : kocom/myhome/elevator/command
     elif 'elevator' in topic_d:
         dev_id = device_h_dic['elevator'] + room_h_dic.get(topic_d[1])
-
+        state_on = json.dumps({'state': 'on'})
+        state_off = json.dumps({'state': 'off'})
         if command == 'on':
-            if send(dest='0100', src=dev_id, cmd=cmd_h_dic['on'], value='03'+'0'*14, log='elevator', check_ack=False) == False:
-                return
+            ret_elevator = None
+            if config.get('Elevator', 'type', fallback='rs485') == 'rs485':
+                ret_elevator = send(dest=device_h_dic['wallpad']+'00', src=dev_id, cmd=cmd_h_dic['on'], value='0'*16, log='elevator', check_ack=False)
+            elif config.get('Elevator', 'type', fallback='rs485') == 'tcpip':
+                ret_elevator = call_elevator_tcpip()
 
-        if command == 'on' or command == 'off':
-            state = {'state': command}
-            state = json.dumps(state)
-            threading.Thread(target=mqttc.publish, args=("kocom/myhome/elevator/state", state)).start()
+            if ret_elevator == False:
+                logging.debug('elevator send failed')
+                return
+       
+            threading.Thread(target=mqttc.publish, args=("kocom/myhome/elevator/state", state_on)).start()
+            if config.get('Elevator', 'rs485_floor', fallback=None) == None:
+                threading.Timer(5, mqttc.publish, args=("kocom/myhome/elevator/state", state_off)).start()
+ 
+        elif command == 'off':
+            threading.Thread(target=mqttc.publish, args=("kocom/myhome/elevator/state", state_off)).start()
 
     # kocom/livingroom/fan/command
     elif 'fan' in topic_d:
@@ -411,39 +468,53 @@ def mqtt_on_message(mqttc, obj, msg):
         elif command in speed_dic.keys(): # fan on with specified speed
             onoff = onoff_dic['on'] 
             speed = speed_dic.get(command)
-        
+
         value = onoff + speed + '0'*10
         send_wait_response(dest=dev_id, value=value, log='fan')
 
 
-#===== parse hex packet --> publish MQTT ===== 
+#===== parse hex packet --> publish MQTT =====
 
 def publish_status(p):
     threading.Thread(target=packet_processor, args=(p,)).start()
 
 def packet_processor(p):
+    logtxt = ""
     if p['type']=='ack' and p['src']=='wallpad':  # ack from wallpad
+    #if p['type']=='send' and p['dest']=='wallpad':  # response packet to wallpad
         if p['dest'] == 'thermo' and p['cmd']=='state':
+        #if p['src'] == 'thermo' and p['cmd']=='state':
             state = thermo_parse(p['value'])
-            logging.info('[MQTT publish|thermo] room{} data[{}]'.format(p['dest_subid'], state))
+            logtxt='[MQTT publish|thermo] room{} data[{}]'.format(p['dest_subid'], state)
             mqttc.publish("kocom/room/thermo/" + p['dest_subid'] + "/state", json.dumps(state))
         elif p['dest'] == 'light' and p['cmd']=='state':
+        #elif p['src'] == 'light' and p['cmd']=='state':
             state = light_parse(p['value'])
-            logging.info('[MQTT publish|light] data[{}]'.format(state))
+            logtxt='[MQTT publish|light] data[{}]'.format(state)
             mqttc.publish("kocom/livingroom/light/state", json.dumps(state))
         elif p['dest'] == 'fan' and p['cmd']=='state':
+        #elif p['src'] == 'fan' and p['cmd']=='state':
             state = fan_parse(p['value'])
-            logging.info('[MQTT publish|fan] data[{}]'.format(state))
+            logtxt='[MQTT publish|fan] data[{}]'.format(state)
             mqttc.publish("kocom/livingroom/fan/state", json.dumps(state))    
         elif p['dest'] == 'gas':
+        #elif p['src'] == 'gas':
             state = {'state': p['cmd']}
-            logging.info('[MQTT publish|gas] data[{}]'.format(state))
+            logtxt='[MQTT publish|gas] data[{}]'.format(state)
             mqttc.publish("kocom/livingroom/gas/state", json.dumps(state))
     elif p['type']=='send' and p['dest']=='elevator':
-        state = {'state': 'off'}
-        logging.info('[MQTT publish|elevator] data[{}]'.format(state))
+        floor = int(p['value'][2:4],16)
+        rs485_floor = int(config.get('Elevator','rs485_floor', fallback=0))
+        if rs485_floor != 0 :
+            state = {'state': 'off' if rs485_floor==floor else 'on', 'floor': floor}
+        else:
+            state = {'state': 'off'}
+        logtxt='[MQTT publish|elevator] data[{}]'.format(state)
         mqttc.publish("kocom/myhome/elevator/state", json.dumps(state))
         # aa5530bc0044000100010300000000000000350d0d
+
+    if logtxt != "" and config.get('Log', 'show_mqtt_publish') == 'True':
+        logging.info(logtxt)
 
 
 #===== thread functions ===== 
@@ -471,7 +542,7 @@ def poll_state():
             sub_id = room_h_dic.get(dev[1])
         else:
             sub_id = '00'
-        
+
         if dev_id != None and sub_id != None:
             if query(dev_id + sub_id, publish=True)['flag'] == False:
                 break
@@ -495,11 +566,16 @@ def read_serial():
             if buf[:len(header_h)] != header_h[:len(buf)]:
                 not_parsed_buf += buf
                 buf=''
-                continue
-            else:
-                if not_parsed_buf != '':
-                    logging.info('[comm] not parsed '+not_parsed_buf)
-                    not_parsed_buf = ''
+                frame_start = not_parsed_buf.find(header_h, len(header_h))
+                if frame_start < 0:
+                    continue
+                else:
+                    not_parsed_buf = not_parsed_buf[:frame_start]
+                    buf = not_parsed_buf[frame_start:]
+            
+            if not_parsed_buf != '':
+                logging.info('[comm] not parsed '+not_parsed_buf)
+                not_parsed_buf = ''
 
 
             if len(buf) == packet_size*2:
@@ -525,7 +601,7 @@ def read_serial():
             poll_timer.cancel()
             del cache_data[:]
             rs485.reconnect()
-            poll_timer = threading.Timer(1, poll_state)
+            poll_timer = threading.Timer(2, poll_state)
             poll_timer.start()
 
 
@@ -549,6 +625,11 @@ def listen_hexdata():
  
         if wait_target.empty() == False:
             if p_ret['dest_h'] == wait_target.queue[0] and p_ret['type'] == 'ack':
+            #if p_ret['src_h'] == wait_target.queue[0] and p_ret['type'] == 'send':
+                if len(ack_data) != 0:
+                    logging.info("[ACK] No ack received, but responce packet received before ACK. Assuming ACK OK")
+                    ack_q.put(d)
+                    time.sleep(0.5)
                 wait_q.put(p_ret)
                 continue
         publish_status(p_ret)
