@@ -57,13 +57,23 @@ def init_mqttc():
     mqttc.on_disconnect = mqtt_on_disconnect
 
     if config.get('MQTT','mqtt_allow_anonymous') != 'True':
-        logging.info("[MQTT] connecting using username and password")
+        logtxt = "[MQTT] connecting (using username and password)"
         mqttc.username_pw_set(username=config.get('MQTT','mqtt_username',fallback=''), password=config.get('MQTT','mqtt_password',fallback=''))
+    else:
+        logtxt = "[MQTT] connecting (anonymous)"
+
     mqtt_server = config.get('MQTT','mqtt_server')
     mqtt_port = int(config.get('MQTT','mqtt_port'))
-    mqttc.connect(mqtt_server, mqtt_port, 60)
-    mqttc.loop_start()
-    return mqttc
+    for retry_cnt in range(1,31):
+        try:
+            logging.info(logtxt)
+            mqttc.connect(mqtt_server, mqtt_port, 60)
+            mqttc.loop_start()
+            return mqttc
+        except:
+            logging.error('[MQTT] connection failure. #' + str(retry_cnt))
+            time.sleep(10)
+    return False
 
 def mqtt_on_subscribe(mqttc, obj, mid, granted_qos):
     logging.info("[MQTT] Subscribed: " + str(mid) + " " + str(granted_qos))
@@ -118,10 +128,10 @@ class RS485Wrapper:
             ser.stopbits = 1
             if ser.is_open == False:
                 raise Exception('Not ready')
-            logging.info('Serial connected : {}'.format(ser))
+            logging.info('[RS485] Serial connected : {}'.format(ser))
             return ser
         except Exception as e:
-            logging.error('Serial open failure : {}'.format(e))
+            logging.error('[RS485] Serial open failure : {}'.format(e))
             return False
 
     def connect_socket(self, SOCKET_SERVER, SOCKET_PORT):
@@ -130,9 +140,9 @@ class RS485Wrapper:
         try:
             sock.connect((SOCKET_SERVER, SOCKET_PORT))
         except Exception as e:
-            logging.error('Socket connection failure : {} | server {}, port {}'.format(e, SOCKET_SERVER, SOCKET_PORT))
+            logging.error('[RS485] Socket connection failure : {} | server {}, port {}'.format(e, SOCKET_SERVER, SOCKET_PORT))
             return False
-        logging.info('socket connected | server {}, port {}'.format(SOCKET_SERVER, SOCKET_PORT))
+        logging.info('[RS485] Socket connected | server {}, port {}'.format(SOCKET_SERVER, SOCKET_PORT))
         sock.settimeout(polling_interval+15)   # set read timeout a little bit more than polling interval
         return sock
 
@@ -187,7 +197,7 @@ class RS485Wrapper:
     def reconnect(self):
         self.close()
         while True: 
-            logging.info('reconnecting to RS485...')
+            logging.info('[RS485] reconnecting to RS485...')
             if self.connect() != False:
                 break
             time.sleep(10)
@@ -205,7 +215,7 @@ def send(dest, src, cmd, value, log=None, check_ack=True):
             if rs485.write(bytearray.fromhex(send_data)) == False:
                 raise Exception('Not ready')
         except Exception as ex:
-            logging.error("*** Write error.[{}]".format(ex) )
+            logging.error("[RS485] Write error.[{}]".format(ex) )
             break
         if log != None:
             logging.info('[SEND|{}] {}'.format(log, send_data))
@@ -226,7 +236,7 @@ def send(dest, src, cmd, value, log=None, check_ack=True):
             pass
 
     if ret == False:
-        logging.info('send failed. closing RS485. it will try to reconnect to RS485 shortly.')
+        logging.info('[RS485] send failed. closing RS485. it will try to reconnect to RS485 shortly.')
         rs485.close()
     ack_data.clear()
     send_lock.release()
@@ -506,7 +516,9 @@ def packet_processor(p):
         floor = int(p['value'][2:4],16)
         rs485_floor = int(config.get('Elevator','rs485_floor', fallback=0))
         if rs485_floor != 0 :
-            state = {'state': 'off' if rs485_floor==floor else 'on', 'floor': floor}
+            state = {'floor': floor}
+            if rs485_floor==floor:
+                state['state'] = 'off'
         else:
             state = {'state': 'off'}
         logtxt='[MQTT publish|elevator] data[{}]'.format(state)
@@ -650,12 +662,16 @@ if __name__ == "__main__":
         import socket
         rs485 = RS485Wrapper(socket_server = config.get('RS485', 'socket_server'), socket_port = int(config.get('RS485', 'socket_port')))
     else:
-        logging.error('[CONFIG] invalid type value in [RS485]: only "serial" or "socket" is allowed')
+        logging.error('[CONFIG] invalid type value in [RS485]: only "serial" or "socket" is allowed. exit')
         exit(1)
     if rs485.connect() == False:
+        logging.error('[RS485] connection error. exit')
         exit(1)
 
     mqttc = init_mqttc()
+    if mqttc == False:
+        logging.error('[MQTT] conection error. exit')
+        exit(1)
 
     msg_q = queue.Queue(BUF_SIZE)
     ack_q = queue.Queue(1)
